@@ -60,7 +60,8 @@ CSV_COLUMNS = [
 ]
 
 TUNING_CSV_COLUMNS = [
-    "method", "f_S", "lr", "T", "alpha",
+    "stage", "method", "f_S", "param_name", "param_val",
+    "lr", "T", "alpha", "at_beta", "tune_max_steps",
     "val_acc", "train_steps", "wall_time_s", "steps_per_sec",
 ]
 
@@ -114,6 +115,11 @@ def build_grid(cfg: dict) -> list[dict]:
     methods = cfg["methods"]
     seeds = cfg["seeds"]
 
+    default_lr = cfg.get("lr", 0.1)
+    default_T = cfg.get("T", cfg.get("temperature", 4.0))
+    default_alpha = cfg.get("alpha", 0.9)
+    default_beta = cfg.get("at_beta", 1000.0)
+
     for seed, method in product(seeds, methods):
         # ── Regime A: teacher always on 100% data ───────────────────────────
         f_T_A = 1.0
@@ -125,6 +131,10 @@ def build_grid(cfg: dict) -> list[dict]:
                 "f_t": f_T_A,
                 "f_s": f_S,
                 "seed": seed,
+                "lr": default_lr,
+                "T": default_T,
+                "alpha": default_alpha,
+                "at_beta": default_beta,
             })
 
         # ── Regime B: teacher on same subset as student ─────────────────────
@@ -140,6 +150,10 @@ def build_grid(cfg: dict) -> list[dict]:
                 "f_t": f_S,   # f_T == f_S
                 "f_s": f_S,
                 "seed": seed,
+                "lr": default_lr,
+                "T": default_T,
+                "alpha": default_alpha,
+                "at_beta": default_beta,
             })
 
     return runs
@@ -147,54 +161,196 @@ def build_grid(cfg: dict) -> list[dict]:
 
 # ── Hyperparameter tuning helpers ─────────────────────────────────────────────
 
-def build_tuning_grid(cfg: dict) -> list[dict]:
-    """Build the hyperparameter tuning grid for seed 0."""
-    runs = []
-    student_fractions = cfg["student_fractions"]
-    methods = cfg["methods"]
+def _parse_fractions(raw) -> list[float]:
+    """Parse fractions from a list, tuple, or comma-separated string."""
+    if isinstance(raw, (list, tuple)):
+        items = []
+        for x in raw:
+            if isinstance(x, str) and "," in x:
+                items.extend(float(v.strip()) for v in x.split(",") if v.strip())
+            else:
+                items.append(float(x))
+        return items
+    elif isinstance(raw, str):
+        return [float(v.strip()) for v in raw.split(",") if v.strip()]
+    return [0.01, 0.10, 1.0]
 
-    # 3 lr values
+
+def build_sequential_tuning_plan(
+    cfg: dict,
+    tune_fractions: list[float] | None = None,
+) -> list[dict]:
+    """Build the planned sequence of tuning steps across (method, f_S) cells.
+
+    Candidate grids:
+      lr candidates (3 values): [0.05, 0.1, 0.2]
+      For CE: only lr is tuned (3 runs per fraction).
+      For logit_kd:
+        Stage 1: lr (3 values) with default T=4.0, alpha=0.9
+        Stage 2: T (3 values: [2.0, 4.0, 8.0]) with best lr
+        Stage 3: alpha (3 values: [0.5, 0.7, 0.9]) with best lr, best T
+        (Total 9 runs per fraction)
+      For attention_transfer:
+        Total loss = CE + at_beta * at_loss (no logit-KD term).
+        Stage 1: lr (3 values) with default at_beta=1000.0
+        Stage 2: at_beta (4 values: [100.0, 500.0, 1000.0, 5000.0]) with best lr
+        (Total 7 runs per fraction)
+
+    Total per fraction = 3 + 9 + 7 = 19 runs.
+    For 3 default fractions (0.01, 0.10, 1.0) = 57 runs.
+    """
+    if tune_fractions is None:
+        tune_fractions = [0.01, 0.10, 1.0]
+
+    methods = [m for m in cfg.get("methods", ["ce", "logit_kd", "attention_transfer"])]
     lr_candidates = [0.05, 0.1, 0.2]
+    T_candidates = [2.0, 4.0, 8.0]
+    alpha_candidates = [0.5, 0.7, 0.9]
+    beta_candidates = [100.0, 500.0, 1000.0, 5000.0]
 
-    for method in methods:
-        is_kd = method in ("logit_kd", "attention_transfer")
-        T_candidates = [2.0, 4.0, 8.0] if is_kd else [cfg.get("temperature", 4.0)]
-        alpha_candidates = [0.5, 0.9] if is_kd else [cfg.get("alpha", 0.9)]
+    default_lr = cfg.get("lr", 0.1)
+    default_T = cfg.get("T", cfg.get("temperature", 4.0))
+    default_alpha = cfg.get("alpha", 0.9)
+    default_beta = cfg.get("at_beta", 1000.0)
 
-        for f_S in student_fractions:
-            for lr, T, alpha in product(lr_candidates, T_candidates, alpha_candidates):
-                runs.append({
-                    **cfg,
-                    "role": "student",
-                    "regime": "A",
-                    "method": method,
-                    "f_t": 1.0,
-                    "f_s": f_S,
-                    "seed": 0,
-                    "lr": lr,
-                    "T": T,
-                    "alpha": alpha,
-                })
-    return runs
+    steps = []
+    for f_S in tune_fractions:
+        for method in methods:
+            if method == "ce":
+                # Stage 1: lr only
+                for lr in lr_candidates:
+                    steps.append({
+                        **cfg,
+                        "stage": "lr",
+                        "param_name": "lr",
+                        "param_val": lr,
+                        "role": "student",
+                        "regime": "A",
+                        "method": "ce",
+                        "f_t": 1.0,
+                        "f_s": f_S,
+                        "seed": 0,
+                        "lr": lr,
+                        "T": default_T,
+                        "alpha": default_alpha,
+                        "at_beta": default_beta,
+                    })
+            elif method == "logit_kd":
+                # Stage 1: lr with default T and alpha
+                for lr in lr_candidates:
+                    steps.append({
+                        **cfg,
+                        "stage": "lr",
+                        "param_name": "lr",
+                        "param_val": lr,
+                        "role": "student",
+                        "regime": "A",
+                        "method": "logit_kd",
+                        "f_t": 1.0,
+                        "f_s": f_S,
+                        "seed": 0,
+                        "lr": lr,
+                        "T": default_T,
+                        "alpha": default_alpha,
+                        "at_beta": default_beta,
+                    })
+                # Stage 2: T with best lr (using default_lr as placeholder in plan)
+                for T in T_candidates:
+                    steps.append({
+                        **cfg,
+                        "stage": "T",
+                        "param_name": "T",
+                        "param_val": T,
+                        "role": "student",
+                        "regime": "A",
+                        "method": "logit_kd",
+                        "f_t": 1.0,
+                        "f_s": f_S,
+                        "seed": 0,
+                        "lr": default_lr,
+                        "T": T,
+                        "alpha": default_alpha,
+                        "at_beta": default_beta,
+                    })
+                # Stage 3: alpha with best lr and T (using default_T as placeholder)
+                for alpha in alpha_candidates:
+                    steps.append({
+                        **cfg,
+                        "stage": "alpha",
+                        "param_name": "alpha",
+                        "param_val": alpha,
+                        "role": "student",
+                        "regime": "A",
+                        "method": "logit_kd",
+                        "f_t": 1.0,
+                        "f_s": f_S,
+                        "seed": 0,
+                        "lr": default_lr,
+                        "T": default_T,
+                        "alpha": alpha,
+                        "at_beta": default_beta,
+                    })
+            elif method == "attention_transfer":
+                # Total loss has no logit-KD term: CE + at_beta * AT
+                # Stage 1: lr with default at_beta
+                for lr in lr_candidates:
+                    steps.append({
+                        **cfg,
+                        "stage": "lr",
+                        "param_name": "lr",
+                        "param_val": lr,
+                        "role": "student",
+                        "regime": "A",
+                        "method": "attention_transfer",
+                        "f_t": 1.0,
+                        "f_s": f_S,
+                        "seed": 0,
+                        "lr": lr,
+                        "T": default_T,
+                        "alpha": default_alpha,
+                        "at_beta": default_beta,
+                    })
+                # Stage 2: at_beta with best lr
+                for beta in beta_candidates:
+                    steps.append({
+                        **cfg,
+                        "stage": "at_beta",
+                        "param_name": "at_beta",
+                        "param_val": beta,
+                        "role": "student",
+                        "regime": "A",
+                        "method": "attention_transfer",
+                        "f_t": 1.0,
+                        "f_s": f_S,
+                        "seed": 0,
+                        "lr": default_lr,
+                        "T": default_T,
+                        "alpha": default_alpha,
+                        "at_beta": beta,
+                    })
+    return steps
 
 
-def _load_existing_tuning_results(csv_path: Path) -> set[tuple]:
-    """Return set of (method, f_S, lr, T, alpha) already recorded."""
-    done = set()
+# Alias for backward-compatibility with tests
+build_tuning_grid = build_sequential_tuning_plan
+
+
+def _load_existing_tuning_results(csv_path: Path) -> dict[tuple, dict]:
+    """Return a mapping of (method, f_S, lr, T, alpha, at_beta) -> row dict."""
+    done: dict[tuple, dict] = {}
     if not csv_path.exists():
         return done
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
-                key = (
-                    row["method"],
-                    float(row["f_S"]),
-                    float(row["lr"]),
-                    float(row["T"]),
-                    float(row["alpha"]),
-                )
-                done.add(key)
+                method = row["method"]
+                f_s = float(row["f_S"])
+                lr = float(row["lr"])
+                T = float(row["T"]) if row.get("T") else 4.0
+                alpha = float(row["alpha"]) if row.get("alpha") else 0.9
+                at_beta = float(row["at_beta"]) if row.get("at_beta") else 1000.0
+                done[(method, f_s, lr, T, alpha, at_beta)] = row
             except (KeyError, ValueError):
                 pass
     return done
@@ -203,7 +359,7 @@ def _load_existing_tuning_results(csv_path: Path) -> set[tuple]:
 def _append_tuning_row(csv_path: Path, row: dict) -> None:
     write_header = not csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=TUNING_CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=TUNING_CSV_COLUMNS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -226,15 +382,51 @@ def select_and_save_best_hyperparams(tuning_csv_path: Path, best_config_path: Pa
                 pass
 
     for (method, f_S), group_rows in rows_by_group.items():
-        best_row = max(group_rows, key=lambda r: float(r["val_acc"]))
         if method not in best:
             best[method] = {}
-        best[method][f"{f_S:.2f}"] = {
-            "lr": float(best_row["lr"]),
-            "T": float(best_row["T"]),
-            "alpha": float(best_row["alpha"]),
-            "best_val_acc": float(best_row["val_acc"]),
-        }
+
+        has_stages = any("stage" in r and r["stage"] for r in group_rows)
+        if has_stages:
+            lr_rows = [r for r in group_rows if r.get("stage") == "lr"]
+            best_lr_row = max(lr_rows, key=lambda r: float(r["val_acc"])) if lr_rows else max(group_rows, key=lambda r: float(r["val_acc"]))
+            best_lr = float(best_lr_row["lr"])
+            entry = {"lr": best_lr}
+
+            if method == "logit_kd":
+                t_rows = [r for r in group_rows if r.get("stage") == "T"]
+                best_t_row = max(t_rows, key=lambda r: float(r["val_acc"])) if t_rows else best_lr_row
+                best_T = float(best_t_row.get("T", 4.0))
+
+                alpha_rows = [r for r in group_rows if r.get("stage") == "alpha"]
+                best_alpha_row = max(alpha_rows, key=lambda r: float(r["val_acc"])) if alpha_rows else best_t_row
+                best_alpha = float(best_alpha_row.get("alpha", 0.9))
+
+                entry["T"] = best_T
+                entry["alpha"] = best_alpha
+                entry["best_val_acc"] = float(best_alpha_row["val_acc"])
+            elif method == "attention_transfer":
+                beta_rows = [r for r in group_rows if r.get("stage") == "at_beta"]
+                best_beta_row = max(beta_rows, key=lambda r: float(r["val_acc"])) if beta_rows else best_lr_row
+                best_beta = float(best_beta_row.get("at_beta", 1000.0))
+
+                entry["at_beta"] = best_beta
+                entry["best_val_acc"] = float(best_beta_row["val_acc"])
+            else:
+                entry["best_val_acc"] = float(best_lr_row["val_acc"])
+        else:
+            best_row = max(group_rows, key=lambda r: float(r["val_acc"]))
+            entry = {
+                "lr": float(best_row["lr"]),
+                "best_val_acc": float(best_row["val_acc"]),
+            }
+            if "T" in best_row and best_row["T"] != "":
+                entry["T"] = float(best_row["T"])
+            if "alpha" in best_row and best_row["alpha"] != "":
+                entry["alpha"] = float(best_row["alpha"])
+            if "at_beta" in best_row and best_row["at_beta"] != "":
+                entry["at_beta"] = float(best_row["at_beta"])
+
+        best[method][f"{f_S:.2f}"] = entry
 
     save_yaml(best, best_config_path)
     logger.info("Saved best hyperparameters to %s", best_config_path)
@@ -242,7 +434,11 @@ def select_and_save_best_hyperparams(tuning_csv_path: Path, best_config_path: Pa
 
 
 def apply_tuned_hyperparams(grid: list[dict], tuned_config_path: Path) -> list[dict]:
-    """Override grid hyperparams with tuned settings if available."""
+    """Override grid hyperparams with tuned settings if available.
+
+    For fractions that were not explicitly tuned, applies settings from the
+    nearest tuned fraction (by minimum absolute difference |f_tuned - f_S|).
+    """
     if not tuned_config_path.exists():
         return grid
     tuned = load_yaml_config(tuned_config_path)
@@ -251,15 +447,35 @@ def apply_tuned_hyperparams(grid: list[dict], tuned_config_path: Path) -> list[d
 
     for run in grid:
         method = run["method"]
-        f_s_key = f"{run['f_s']:.2f}"
-        if method in tuned and f_s_key in tuned[method]:
-            settings = tuned[method][f_s_key]
-            if "lr" in settings:
-                run["lr"] = settings["lr"]
-            if "T" in settings:
-                run["T"] = settings["T"]
-            if "alpha" in settings:
-                run["alpha"] = settings["alpha"]
+        if method not in tuned:
+            continue
+        method_settings = tuned[method]
+        if not method_settings:
+            continue
+
+        tuned_fractions = [float(k) for k in method_settings.keys()]
+        run_fs = float(run["f_s"])
+        nearest_f = min(tuned_fractions, key=lambda tf: abs(tf - run_fs))
+
+        # Match key in method_settings
+        matched_key = None
+        for k in method_settings.keys():
+            if abs(float(k) - nearest_f) < 1e-5:
+                matched_key = k
+                break
+        if matched_key is None:
+            continue
+
+        settings = method_settings[matched_key]
+        if "lr" in settings:
+            run["lr"] = settings["lr"]
+        if "T" in settings:
+            run["T"] = settings["T"]
+        if "alpha" in settings:
+            run["alpha"] = settings["alpha"]
+        if "at_beta" in settings:
+            run["at_beta"] = settings["at_beta"]
+
     logger.info("Applied tuned hyperparameters from %s to grid.", tuned_config_path)
     return grid
 
@@ -420,82 +636,205 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Print the full list of planned runs without training.")
     p.add_argument("--tune", action="store_true",
-                   help="Run hyperparameter tuning over lr, T, and alpha for seed 0, selecting by validation accuracy.")
+                   help="Run hyperparameter tuning over lr, T/beta, and alpha for seed 0, selecting by validation accuracy.")
+    p.add_argument("--tune-fractions", "--tune_fractions", nargs="+", default=["0.01", "0.10", "1.0"],
+                   dest="tune_fractions", help="Student data fractions to tune on (default: 0.01 0.10 1.0).")
+    p.add_argument("--tune-max-steps", "--tune_max_steps", type=int, default=None,
+                   dest="tune_max_steps", help="Cap optimizer steps for tuning runs.")
     p.add_argument("--tuned-config", default=None,
                    help="Path to YAML file with tuned hyperparameters (defaults to <output_dir>/best_hyperparams.yaml if present).")
     return p.parse_args(argv)
 
 
-def run_tuning(cfg: dict, dry_run: bool = False) -> None:
-    """Execute or plan hyperparameter tuning runs on seed 0."""
+def run_tuning(
+    cfg: dict,
+    tune_fractions: list[float] | None = None,
+    tune_max_steps: int | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Execute or plan sequential hyperparameter tuning runs on seed 0."""
+    if tune_fractions is None:
+        tune_fractions = [0.01, 0.10, 1.0]
+
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     tuning_csv = output_dir / "tuning.csv"
     best_config_path = output_dir / "best_hyperparams.yaml"
 
-    tuning_grid = build_tuning_grid(cfg)
     done = _load_existing_tuning_results(tuning_csv)
+    plan = build_sequential_tuning_plan(cfg, tune_fractions=tune_fractions)
 
     print(f"\n{'='*60}")
-    print(f"  KD-LowData Hyperparameter Tuning — {'DRY RUN' if dry_run else 'EXECUTION'}")
+    print(f"  KD-LowData Hyperparameter Tuning -- {'DRY RUN' if dry_run else 'EXECUTION'}")
     print(f"{'='*60}")
 
-    pending = 0
-    skipped = 0
+    if dry_run:
+        pending = 0
+        skipped = 0
+        for step in plan:
+            key = (step["method"], step["f_s"], step["lr"], step["T"], step["alpha"], step["at_beta"])
+            if key in done:
+                skipped += 1
+                continue
+            pending += 1
+            if step["method"] == "ce":
+                desc = f"lr={step['param_val']}"
+            elif step["method"] == "logit_kd":
+                desc = f"{step['param_name']}={step['param_val']} (lr={step['lr']}, T={step['T']}, alpha={step['alpha']})"
+            else:  # attention_transfer
+                desc = f"{step['param_name']}={step['param_val']} (lr={step['lr']}, at_beta={step['at_beta']})"
+            print(f"  PLAN  [stage={step['stage']}] {step['method']} f_S={step['f_s']:.2f} {desc}")
 
-    for run in tuning_grid:
-        key = (run["method"], run["f_s"], run["lr"], run["T"], run["alpha"])
+        print(f"\n{'='*60}")
+        print(f"  Total tuning candidate runs: {len(plan)}")
+        print(f"  Already done (will skip): {skipped}")
+        print(f"  Pending: {pending}")
+        print(f"  Tuning fractions: {tune_fractions}")
+        print(f"  Tuning max steps: {tune_max_steps}")
+        print(f"  Tuning CSV: {tuning_csv}")
+        print(f"  Best params will save to: {best_config_path}")
+        print(f"{'='*60}\n")
+        return
+
+    # Real execution: sequential per (method, f_S) cell
+    methods = [m for m in cfg.get("methods", ["ce", "logit_kd", "attention_transfer"])]
+    lr_candidates = [0.05, 0.1, 0.2]
+    T_candidates = [2.0, 4.0, 8.0]
+    alpha_candidates = [0.5, 0.7, 0.9]
+    beta_candidates = [100.0, 500.0, 1000.0, 5000.0]
+
+    default_lr = cfg.get("lr", 0.1)
+    default_T = cfg.get("T", cfg.get("temperature", 4.0))
+    default_alpha = cfg.get("alpha", 0.9)
+    default_beta = cfg.get("at_beta", 1000.0)
+
+    def _eval_step(method, f_s, stage, param_name, param_val, lr, T, alpha, at_beta) -> float:
+        key = (method, f_s, lr, T, alpha, at_beta)
         if key in done:
-            skipped += 1
-            continue
+            cached_acc = float(done[key]["val_acc"])
+            logger.info("SKIP (cached in %s): %s f_S=%.2f lr=%s T=%s alpha=%s at_beta=%s -> val_acc=%.2f%%",
+                        tuning_csv, method, f_s, lr, T, alpha, at_beta, cached_acc)
+            return cached_acc
 
-        pending += 1
-        label = (
-            f"TUNE {run['method']} f_S={run['f_s']:.2f} lr={run['lr']} "
-            f"T={run['T']} alpha={run['alpha']}"
-        )
-        if dry_run:
-            print(f"  PLAN  {label}")
-            continue
-
+        label = f"[TUNE stage={stage}] {method} f_S={f_s:.2f} {param_name}={param_val} (lr={lr}, T={T}, alpha={alpha}, at_beta={at_beta})"
         logger.info("Running: %s", label)
-        # Ensure teacher checkpoint exists (f_T=1.0, seed=0)
+
         teacher_ckpt = None
-        if run["method"] != "ce":
-            teacher_ckpt = get_or_train_teacher(1.0, 0, run, dry_run=False)
+        if method != "ce":
+            teacher_ckpt = get_or_train_teacher(1.0, 0, cfg, dry_run=False)
 
         student_cfg = {
-            **run,
+            **cfg,
             "role": "student",
+            "regime": "A",
+            "method": method,
+            "f_t": 1.0,
+            "f_s": f_s,
+            "seed": 0,
+            "lr": lr,
+            "T": T,
+            "alpha": alpha,
+            "at_beta": at_beta,
             "teacher_ckpt": str(teacher_ckpt) if teacher_ckpt else None,
         }
+        if tune_max_steps is not None:
+            student_cfg["max_steps_override"] = tune_max_steps
+
         t0 = time.time()
         summary = train(student_cfg)
         wall_time = time.time() - t0
         steps_per_sec = summary.get("steps_per_sec", round(summary["total_steps"] / max(wall_time, 1e-6), 2))
+        val_acc = round(summary["best_val_acc"], 4)
 
-        _append_tuning_row(tuning_csv, {
-            "method": run["method"],
-            "f_S": run["f_s"],
-            "lr": run["lr"],
-            "T": run["T"],
-            "alpha": run["alpha"],
-            "val_acc": round(summary["best_val_acc"], 4),
+        row = {
+            "stage": stage,
+            "method": method,
+            "f_S": f_s,
+            "param_name": param_name,
+            "param_val": param_val,
+            "lr": lr,
+            "T": T,
+            "alpha": alpha,
+            "at_beta": at_beta,
+            "tune_max_steps": tune_max_steps if tune_max_steps is not None else "",
+            "val_acc": val_acc,
             "train_steps": summary["total_steps"],
             "wall_time_s": round(wall_time, 1),
             "steps_per_sec": steps_per_sec,
-        })
+        }
+        _append_tuning_row(tuning_csv, row)
+        done[key] = row
+        return val_acc
 
-    print(f"\n{'='*60}")
-    print(f"  Total tuning candidate runs: {len(tuning_grid)}")
-    print(f"  Already done (will skip): {skipped}")
-    print(f"  Pending: {pending}")
-    print(f"  Tuning CSV: {tuning_csv}")
-    print(f"  Best params will save to: {best_config_path}")
-    print(f"{'='*60}\n")
+    best_hyperparams: dict[str, dict] = {}
+    for f_S in tune_fractions:
+        for method in methods:
+            if method not in best_hyperparams:
+                best_hyperparams[method] = {}
 
-    if not dry_run and tuning_csv.exists():
-        select_and_save_best_hyperparams(tuning_csv, best_config_path)
+            if method == "ce":
+                # Stage 1: tune lr
+                lr_accs = [
+                    (lr, _eval_step("ce", f_S, "lr", "lr", lr, lr, default_T, default_alpha, default_beta))
+                    for lr in lr_candidates
+                ]
+                best_lr, best_acc = max(lr_accs, key=lambda pair: pair[1])
+                best_hyperparams["ce"][f"{f_S:.2f}"] = {
+                    "lr": best_lr,
+                    "best_val_acc": best_acc,
+                }
+            elif method == "logit_kd":
+                # Stage 1: tune lr with default T and alpha
+                lr_accs = [
+                    (lr, _eval_step("logit_kd", f_S, "lr", "lr", lr, lr, default_T, default_alpha, default_beta))
+                    for lr in lr_candidates
+                ]
+                best_lr, _ = max(lr_accs, key=lambda pair: pair[1])
+
+                # Stage 2: tune T with best lr and default alpha
+                t_accs = [
+                    (T, _eval_step("logit_kd", f_S, "T", "T", T, best_lr, T, default_alpha, default_beta))
+                    for T in T_candidates
+                ]
+                best_T, _ = max(t_accs, key=lambda pair: pair[1])
+
+                # Stage 3: tune alpha with best lr and best T
+                alpha_accs = [
+                    (alpha, _eval_step("logit_kd", f_S, "alpha", "alpha", alpha, best_lr, best_T, alpha, default_beta))
+                    for alpha in alpha_candidates
+                ]
+                best_alpha, best_acc = max(alpha_accs, key=lambda pair: pair[1])
+
+                best_hyperparams["logit_kd"][f"{f_S:.2f}"] = {
+                    "lr": best_lr,
+                    "T": best_T,
+                    "alpha": best_alpha,
+                    "best_val_acc": best_acc,
+                }
+            elif method == "attention_transfer":
+                # Total loss = CE + at_beta * AT (no logit-KD term)
+                # Stage 1: tune lr with default at_beta
+                lr_accs = [
+                    (lr, _eval_step("attention_transfer", f_S, "lr", "lr", lr, lr, default_T, default_alpha, default_beta))
+                    for lr in lr_candidates
+                ]
+                best_lr, _ = max(lr_accs, key=lambda pair: pair[1])
+
+                # Stage 2: tune at_beta with best lr
+                beta_accs = [
+                    (beta, _eval_step("attention_transfer", f_S, "at_beta", "at_beta", beta, best_lr, default_T, default_alpha, beta))
+                    for beta in beta_candidates
+                ]
+                best_beta, best_acc = max(beta_accs, key=lambda pair: pair[1])
+
+                best_hyperparams["attention_transfer"][f"{f_S:.2f}"] = {
+                    "lr": best_lr,
+                    "at_beta": best_beta,
+                    "best_val_acc": best_acc,
+                }
+
+    save_yaml(best_hyperparams, best_config_path)
+    logger.info("Saved best hyperparameters to %s", best_config_path)
 
 
 def main(argv=None) -> None:
@@ -518,7 +857,13 @@ def main(argv=None) -> None:
 
     # If --tune requested, run tuning pipeline instead
     if args.tune:
-        run_tuning(cfg, dry_run=args.dry_run)
+        tune_fractions = _parse_fractions(args.tune_fractions)
+        run_tuning(
+            cfg,
+            tune_fractions=tune_fractions,
+            tune_max_steps=args.tune_max_steps,
+            dry_run=args.dry_run,
+        )
         return
 
     csv_path = Path(cfg["output_dir"]) / "results.csv"
@@ -535,7 +880,7 @@ def main(argv=None) -> None:
 
     if args.dry_run:
         print(f"\n{'='*60}")
-        print(f"  KD-LowData Experiment Grid — DRY RUN")
+        print(f"  KD-LowData Experiment Grid -- DRY RUN")
         print(f"{'='*60}")
         # Show teacher runs
         seen_teachers: set[tuple] = set()

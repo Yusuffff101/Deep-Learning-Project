@@ -236,9 +236,9 @@ def train_step(
             labels=labels,
             student_features=s_features,
             teacher_features=t_features,
-            T=cfg["T"],
-            alpha=cfg["alpha"],
-            at_beta=cfg["at_beta"],
+            T=cfg.get("T", cfg.get("temperature", 4.0)),
+            alpha=cfg.get("alpha", 0.9),
+            at_beta=cfg.get("at_beta", 1000.0),
         )
 
     optimizer.zero_grad(set_to_none=True)

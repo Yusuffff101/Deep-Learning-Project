@@ -43,6 +43,7 @@ from models import build_model, resnet20, resnet56
 from run_grid import (
     apply_tuned_hyperparams,
     build_grid,
+    build_sequential_tuning_plan,
     build_tuning_grid,
     select_and_save_best_hyperparams,
 )
@@ -405,34 +406,101 @@ def test_grid_no_duplicate_regime_ab_100():
 
 # ── Test 14: Tuning grid and hyperparameter loading ───────────────────────────
 
-def test_tuning_grid_and_config(tmp_path):
-    """Tuning grid uses seed 0, f_T=1.0, and updates main grid when applied."""
+# ── Test 14: Sequential tuning plan, nearest fraction interpolation, and AT beta ───
+
+def test_sequential_tuning_plan():
+    """Sequential tuning plans 57 runs across 3 fractions: CE(3), LogitKD(9), AT(7)."""
     cfg = load_yaml_config(Path(__file__).parent.parent / "configs" / "default.yaml")
-    tuning_grid = build_tuning_grid(cfg)
+    plan = build_sequential_tuning_plan(cfg, tune_fractions=[0.01, 0.10, 1.0])
 
-    assert len(tuning_grid) > 0
-    assert all(r["seed"] == 0 for r in tuning_grid)
-    assert all(r["f_t"] == 1.0 for r in tuning_grid)
+    assert len(plan) == 57, f"Expected 57 runs, got {len(plan)}"
+    assert all(r["seed"] == 0 for r in plan)
+    assert all(r["f_t"] == 1.0 for r in plan)
 
-    # Test synthetic tuning save & apply
+    # Check breakdown for a single fraction (0.01)
+    f01_steps = [r for r in plan if abs(r["f_s"] - 0.01) < 1e-5]
+    assert len(f01_steps) == 19
+
+    ce_steps = [r for r in f01_steps if r["method"] == "ce"]
+    assert len(ce_steps) == 3
+    assert all(r["stage"] == "lr" for r in ce_steps)
+
+    kd_steps = [r for r in f01_steps if r["method"] == "logit_kd"]
+    assert len(kd_steps) == 9
+    assert len([r for r in kd_steps if r["stage"] == "lr"]) == 3
+    assert len([r for r in kd_steps if r["stage"] == "T"]) == 3
+    assert len([r for r in kd_steps if r["stage"] == "alpha"]) == 3
+
+    at_steps = [r for r in f01_steps if r["method"] == "attention_transfer"]
+    assert len(at_steps) == 7
+    assert len([r for r in at_steps if r["stage"] == "lr"]) == 3
+    assert len([r for r in at_steps if r["stage"] == "at_beta"]) == 4
+
+    # Check single fraction plan
+    single_plan = build_sequential_tuning_plan(cfg, tune_fractions=[0.10])
+    assert len(single_plan) == 19
+
+
+def test_tuning_nearest_fraction_and_at_beta(tmp_path):
+    """Test saving sequential tuning results and nearest fraction interpolation."""
+    cfg = load_yaml_config(Path(__file__).parent.parent / "configs" / "default.yaml")
+
     tuning_csv = tmp_path / "tuning.csv"
     best_yaml = tmp_path / "best_hyperparams.yaml"
 
+    # Synthetic CSV with stage annotations
     with open(tuning_csv, "w", newline="", encoding="utf-8") as f:
-        f.write("method,f_S,lr,T,alpha,val_acc,train_steps,wall_time_s,steps_per_sec\n")
-        f.write("ce,0.05,0.05,4.0,0.9,45.0,100,10.0,10.0\n")
-        f.write("ce,0.05,0.20,4.0,0.9,52.5,100,10.0,10.0\n")
-        f.write("logit_kd,0.05,0.10,8.0,0.5,58.0,100,10.0,10.0\n")
+        f.write("stage,method,f_S,param_name,param_val,lr,T,alpha,at_beta,tune_max_steps,val_acc,train_steps,wall_time_s,steps_per_sec\n")
+        # ce for 0.01: best lr is 0.20
+        f.write("lr,ce,0.01,lr,0.05,0.05,4.0,0.9,1000.0,500,40.0,500,5.0,100.0\n")
+        f.write("lr,ce,0.01,lr,0.20,0.20,4.0,0.9,1000.0,500,48.0,500,5.0,100.0\n")
+        # logit_kd for 0.10: best lr=0.10, best T=8.0, best alpha=0.7
+        f.write("lr,logit_kd,0.10,lr,0.10,0.10,4.0,0.9,1000.0,500,55.0,500,5.0,100.0\n")
+        f.write("T,logit_kd,0.10,T,8.0,0.10,8.0,0.9,1000.0,500,59.0,500,5.0,100.0\n")
+        f.write("alpha,logit_kd,0.10,alpha,0.7,0.10,8.0,0.7,1000.0,500,61.5,500,5.0,100.0\n")
+        # attention_transfer for 1.00: best lr=0.10, best at_beta=500.0
+        f.write("lr,attention_transfer,1.00,lr,0.10,0.10,4.0,0.9,1000.0,500,65.0,500,5.0,100.0\n")
+        f.write("at_beta,attention_transfer,1.00,at_beta,500.0,0.10,4.0,0.9,500.0,500,68.0,500,5.0,100.0\n")
 
     best = select_and_save_best_hyperparams(tuning_csv, best_yaml)
-    assert best["ce"]["0.05"]["lr"] == 0.20
-    assert best["logit_kd"]["0.05"]["T"] == 8.0
+    assert best["ce"]["0.01"]["lr"] == 0.20
+    assert best["logit_kd"]["0.10"]["T"] == 8.0
+    assert best["logit_kd"]["0.10"]["alpha"] == 0.7
+    assert best["attention_transfer"]["1.00"]["at_beta"] == 500.0
 
-    # Test applying to grid
+    # Test applying to main grid with nearest-fraction interpolation
     grid = build_grid(cfg)
     grid = apply_tuned_hyperparams(grid, best_yaml)
-    matched = [r for r in grid if r["method"] == "ce" and abs(r["f_s"] - 0.05) < 1e-5]
-    assert matched[0]["lr"] == 0.20
+
+    # 0.05 is untuned; nearest tuned in {0.01} for CE is 0.01 -> lr=0.20
+    ce_05 = [r for r in grid if r["method"] == "ce" and abs(r["f_s"] - 0.05) < 1e-5][0]
+    assert ce_05["lr"] == 0.20
+
+    # 0.25 is untuned; nearest tuned in {0.10} for logit_kd is 0.10 -> T=8.0, alpha=0.7
+    kd_25 = [r for r in grid if r["method"] == "logit_kd" and abs(r["f_s"] - 0.25) < 1e-5][0]
+    assert kd_25["T"] == 8.0
+    assert kd_25["alpha"] == 0.7
+
+    # 1.00 AT: at_beta=500.0
+    at_100 = [r for r in grid if r["method"] == "attention_transfer" and abs(r["f_s"] - 1.0) < 1e-5][0]
+    assert at_100["at_beta"] == 500.0
+
+
+def test_tune_cli_flags():
+    """Verify --tune-fractions and --tune-max-steps parse correctly."""
+    from run_grid import _parse_fractions, parse_args
+
+    # Comma-separated string
+    assert _parse_fractions("0.01,0.10,1.0") == [0.01, 0.10, 1.0]
+    # Space-separated list of strings from CLI nargs
+    assert _parse_fractions(["0.05", "0.25"]) == [0.05, 0.25]
+    # List containing comma-separated string
+    assert _parse_fractions(["0.01,0.25"]) == [0.01, 0.25]
+
+    args = parse_args(["--tune", "--tune-fractions", "0.01", "0.25", "--tune-max-steps", "1234"])
+    assert args.tune is True
+    assert args.tune_fractions == ["0.01", "0.25"]
+    assert args.tune_max_steps == 1234
 
 
 # ── Test 15: Max steps override and per-fraction min steps ────────────────────

@@ -93,10 +93,13 @@ python src/run_grid.py --dry-run
 # Run pilot with step capping:
 python src/run_grid.py --dry-run --max-steps-override 5
 
-# Run hyperparameter tuning on seed 0:
-python src/run_grid.py --tune
+# Preview sequential tuning runs (57 candidate runs):
+python src/run_grid.py --tune --dry-run
 
-# Run all experiments (safely resumable):
+# Run sequential hyperparameter tuning on seed 0:
+python src/run_grid.py --tune --tune-fractions 0.01 0.10 1.0 --tune-max-steps 5000
+
+# Run all experiments (safely resumable, applying tuned hyperparams):
 python src/run_grid.py --config configs/default.yaml
 ```
 
@@ -104,6 +107,40 @@ The grid skips any configuration whose result row already exists in
 `results/results.csv`, so interrupted Kaggle sessions can be resumed safely.
 Regime A with $f_S=1.0$ and Regime B with $f_T=f_S=1.0$ are deduplicated and executed only once.
 Each run prints a timing summary with step throughput (`steps/s`) to easily extrapolate GPU runtimes.
+
+---
+
+## Sequential Hyperparameter Tuning
+
+Tuning runs on seed 0 across `(method, f_S)` cells to select optimal parameters before launching the full grid:
+
+1. **Stage Sequence per Cell**:
+   - **`ce`**: Tunes `lr` over `[0.05, 0.1, 0.2]` (3 runs).
+   - **`logit_kd`**:
+     - *Stage 1*: Tune `lr` (`[0.05, 0.1, 0.2]`) with default $T=4.0, \alpha=0.9$ (3 runs).
+     - *Stage 2*: Tune $T$ (`[2.0, 4.0, 8.0]`) with best `lr` and default $\alpha=0.9$ (3 runs).
+     - *Stage 3*: Tune $\alpha$ (`[0.5, 0.7, 0.9]`) with best `lr` and best $T$ (3 runs).
+     - Total: 9 runs per fraction.
+   - **`attention_transfer`**:
+     - Loss formulation has **no logit-KD term**: $\mathcal{L}_{total} = \mathcal{L}_{CE} + \beta \mathcal{L}_{AT}$.
+     - *Stage 1*: Tune `lr` (`[0.05, 0.1, 0.2]`) with default $\beta=1000.0$ (3 runs).
+     - *Stage 2*: Tune AT loss weight $\beta$ (`[100.0, 500.0, 1000.0, 5000.0]`) with best `lr` (4 runs).
+     - Total: 7 runs per fraction.
+   - Total per fraction: $3 + 9 + 7 = 19$ runs. Across 3 fractions = **57 candidate runs**.
+
+2. **`--tune-fractions` Flag** (default: `0.01 0.10 1.0`):
+   - Tuning runs only on these designated fractions to conserve compute.
+   - When the main grid loads `best_hyperparams.yaml`, hyperparameter settings from the **nearest tuned fraction** (by minimum absolute difference $|f_{tuned} - f_S|$) are automatically interpolated for untuned fractions:
+     - $f_S = 0.01 \to 0.01$ (exact)
+     - $f_S = 0.05 \to 0.01$ ($|0.05 - 0.01| = 0.04 < |0.05 - 0.10| = 0.05$)
+     - $f_S = 0.10 \to 0.10$ (exact)
+     - $f_S = 0.25 \to 0.10$ ($|0.25 - 0.10| = 0.15 < |0.25 - 1.00| = 0.75$)
+     - $f_S = 1.00 \to 1.00$ (exact)
+
+3. **`--tune-max-steps` Flag**:
+   - Reduces the step budget for faster turnaround during tuning.
+   - The step budget used is logged under the `tune_max_steps` column in `results/tuning.csv`.
+   - Results are saved to `results/best_hyperparams.yaml` and read automatically by the main grid.
 
 ---
 
