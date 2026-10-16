@@ -35,7 +35,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # Local imports
@@ -203,7 +203,7 @@ def train_step(
 
     use_amp = scaler is not None
 
-    with autocast(enabled=use_amp):
+    with autocast(device_type=device.type, enabled=use_amp):
         # Forward: student (and optionally teacher)
         if needs_features:
             s_logits, s_features = model(images, return_features=True)
@@ -351,7 +351,7 @@ def train(cfg: dict) -> dict:
     scheduler = build_scheduler(optimizer, total_steps)
 
     # Mixed precision only on CUDA
-    scaler: Optional[GradScaler] = GradScaler() if device.type == "cuda" else None
+    scaler: Optional[GradScaler] = GradScaler(device="cuda") if device.type == "cuda" else None
 
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_acc: float = 0.0

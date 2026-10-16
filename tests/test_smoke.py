@@ -255,13 +255,14 @@ def _make_tiny_args(role: str, method: str = "ce", teacher_ckpt: str | None = No
     args.teacher_ckpt = teacher_ckpt
     args.lr = 0.1
     args.weight_decay = 5e-4
-    args.epochs = 1
+    args.epochs = 0
     args.batch_size = 8
-    args.min_steps = 2          # Force only 2 steps
+    args.min_steps = 2          # Force only 2 steps (with epochs=0, max(0, 2) == 2)
     args.T = 4.0
     args.alpha = 0.9
     args.at_beta = 1000.0
-    args.data_dir = str(tmp_path / "data")
+    repo_data = Path(__file__).parent.parent / "data"
+    args.data_dir = str(repo_data if repo_data.exists() else (tmp_path / "data"))
     args.checkpoint_dir = str(tmp_path / "checkpoints")
     args.output_dir = str(tmp_path / "results")
     args.num_workers = 0       # Needed on Windows / CPU
