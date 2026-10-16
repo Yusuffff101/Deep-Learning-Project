@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from train import build_config, train
 from evaluate import evaluate_checkpoint
-from utils import load_yaml_config, make_run_id, setup_logging
+from utils import load_yaml_config, make_run_id, save_yaml, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,12 @@ logger = logging.getLogger(__name__)
 CSV_COLUMNS = [
     "regime", "method", "f_T", "f_S", "seed",
     "val_acc", "test_acc", "agreement", "ece",
-    "train_steps", "wall_time_s",
+    "train_steps", "wall_time_s", "steps_per_sec",
+]
+
+TUNING_CSV_COLUMNS = [
+    "method", "f_S", "lr", "T", "alpha",
+    "val_acc", "train_steps", "wall_time_s", "steps_per_sec",
 ]
 
 
@@ -71,14 +76,16 @@ def _load_existing_results(csv_path: Path) -> set[tuple]:
         reader = csv.DictReader(f)
         for row in reader:
             try:
-                key = (
-                    row["regime"],
-                    row["method"],
-                    float(row["f_T"]),
-                    float(row["f_S"]),
-                    int(row["seed"]),
-                )
-                done.add(key)
+                regime = row["regime"]
+                method = row["method"]
+                f_t = float(row["f_T"])
+                f_s = float(row["f_S"])
+                seed = int(row["seed"])
+                done.add((regime, method, f_t, f_s, seed))
+                # Treat Regime A f_S=1.0 and Regime B f_T=f_S=1.0 as the same experiment
+                if abs(f_t - 1.0) < 1e-5 and abs(f_s - 1.0) < 1e-5:
+                    done.add(("A", method, 1.0, 1.0, seed))
+                    done.add(("B", method, 1.0, 1.0, seed))
             except (KeyError, ValueError):
                 pass  # Skip malformed rows
     return done
@@ -122,9 +129,10 @@ def build_grid(cfg: dict) -> list[dict]:
 
         # ── Regime B: teacher on same subset as student ─────────────────────
         for f_S in student_fractions:
-            # In regime B, f_T = f_S; only include teacher_fractions values
-            if f_S not in teacher_fractions:
-                continue  # Skip f_S values that don't exist as f_T options
+            # In regime B, f_T = f_S; only include teacher_fractions values.
+            # Skip f_S=1.0 because it is identical to Regime A (f_T=1.0, f_S=1.0)
+            if f_S not in teacher_fractions or abs(f_S - 1.0) < 1e-5:
+                continue  # Skip f_S values that don't exist as f_T options or duplicate Regime A
             runs.append({
                 **cfg,
                 "regime": "B",
@@ -135,6 +143,125 @@ def build_grid(cfg: dict) -> list[dict]:
             })
 
     return runs
+
+
+# ── Hyperparameter tuning helpers ─────────────────────────────────────────────
+
+def build_tuning_grid(cfg: dict) -> list[dict]:
+    """Build the hyperparameter tuning grid for seed 0."""
+    runs = []
+    student_fractions = cfg["student_fractions"]
+    methods = cfg["methods"]
+
+    # 3 lr values
+    lr_candidates = [0.05, 0.1, 0.2]
+
+    for method in methods:
+        is_kd = method in ("logit_kd", "attention_transfer")
+        T_candidates = [2.0, 4.0, 8.0] if is_kd else [cfg.get("temperature", 4.0)]
+        alpha_candidates = [0.5, 0.9] if is_kd else [cfg.get("alpha", 0.9)]
+
+        for f_S in student_fractions:
+            for lr, T, alpha in product(lr_candidates, T_candidates, alpha_candidates):
+                runs.append({
+                    **cfg,
+                    "role": "student",
+                    "regime": "A",
+                    "method": method,
+                    "f_t": 1.0,
+                    "f_s": f_S,
+                    "seed": 0,
+                    "lr": lr,
+                    "T": T,
+                    "alpha": alpha,
+                })
+    return runs
+
+
+def _load_existing_tuning_results(csv_path: Path) -> set[tuple]:
+    """Return set of (method, f_S, lr, T, alpha) already recorded."""
+    done = set()
+    if not csv_path.exists():
+        return done
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                key = (
+                    row["method"],
+                    float(row["f_S"]),
+                    float(row["lr"]),
+                    float(row["T"]),
+                    float(row["alpha"]),
+                )
+                done.add(key)
+            except (KeyError, ValueError):
+                pass
+    return done
+
+
+def _append_tuning_row(csv_path: Path, row: dict) -> None:
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TUNING_CSV_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def select_and_save_best_hyperparams(tuning_csv_path: Path, best_config_path: Path) -> dict:
+    """Parse tuning.csv, select best hyperparams by val_acc per (method, f_S), and save YAML."""
+    best: dict[str, dict] = {}
+    if not tuning_csv_path.exists():
+        return best
+
+    rows_by_group: dict[tuple, list[dict]] = {}
+    with open(tuning_csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                group_key = (row["method"], float(row["f_S"]))
+                rows_by_group.setdefault(group_key, []).append(row)
+            except (KeyError, ValueError):
+                pass
+
+    for (method, f_S), group_rows in rows_by_group.items():
+        best_row = max(group_rows, key=lambda r: float(r["val_acc"]))
+        if method not in best:
+            best[method] = {}
+        best[method][f"{f_S:.2f}"] = {
+            "lr": float(best_row["lr"]),
+            "T": float(best_row["T"]),
+            "alpha": float(best_row["alpha"]),
+            "best_val_acc": float(best_row["val_acc"]),
+        }
+
+    save_yaml(best, best_config_path)
+    logger.info("Saved best hyperparameters to %s", best_config_path)
+    return best
+
+
+def apply_tuned_hyperparams(grid: list[dict], tuned_config_path: Path) -> list[dict]:
+    """Override grid hyperparams with tuned settings if available."""
+    if not tuned_config_path.exists():
+        return grid
+    tuned = load_yaml_config(tuned_config_path)
+    if not tuned:
+        return grid
+
+    for run in grid:
+        method = run["method"]
+        f_s_key = f"{run['f_s']:.2f}"
+        if method in tuned and f_s_key in tuned[method]:
+            settings = tuned[method][f_s_key]
+            if "lr" in settings:
+                run["lr"] = settings["lr"]
+            if "T" in settings:
+                run["T"] = settings["T"]
+            if "alpha" in settings:
+                run["alpha"] = settings["alpha"]
+    logger.info("Applied tuned hyperparameters from %s to grid.", tuned_config_path)
+    return grid
 
 
 # ── Teacher checkpoint resolution ─────────────────────────────────────────────
@@ -257,6 +384,11 @@ def run_one(run_spec: dict, csv_path: Path, dry_run: bool = False) -> None:
         test_acc = agreement = ece = None
 
     # 4. Append to CSV
+    steps_per_sec = summary.get(
+        "steps_per_sec",
+        round(summary["total_steps"] / max(wall_time, 1e-6), 2)
+    )
+
     _append_result_row(csv_path, {
         "regime": regime,
         "method": method,
@@ -269,8 +401,9 @@ def run_one(run_spec: dict, csv_path: Path, dry_run: bool = False) -> None:
         "ece": round(ece, 6) if ece is not None else "",
         "train_steps": summary["total_steps"],
         "wall_time_s": round(wall_time, 1),
+        "steps_per_sec": steps_per_sec,
     })
-    logger.info("Appended result to %s", csv_path)
+    logger.info("Appended result to %s (throughput: %.2f steps/s)", csv_path, steps_per_sec)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -282,9 +415,87 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--output_dir", default=None)
     p.add_argument("--checkpoint_dir", default=None)
     p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--max-steps-override", "--max_steps_override", type=int, default=None,
+                   dest="max_steps_override", help="Cap total optimizer steps for pilot runs.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the full list of planned runs without training.")
+    p.add_argument("--tune", action="store_true",
+                   help="Run hyperparameter tuning over lr, T, and alpha for seed 0, selecting by validation accuracy.")
+    p.add_argument("--tuned-config", default=None,
+                   help="Path to YAML file with tuned hyperparameters (defaults to <output_dir>/best_hyperparams.yaml if present).")
     return p.parse_args(argv)
+
+
+def run_tuning(cfg: dict, dry_run: bool = False) -> None:
+    """Execute or plan hyperparameter tuning runs on seed 0."""
+    output_dir = Path(cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tuning_csv = output_dir / "tuning.csv"
+    best_config_path = output_dir / "best_hyperparams.yaml"
+
+    tuning_grid = build_tuning_grid(cfg)
+    done = _load_existing_tuning_results(tuning_csv)
+
+    print(f"\n{'='*60}")
+    print(f"  KD-LowData Hyperparameter Tuning — {'DRY RUN' if dry_run else 'EXECUTION'}")
+    print(f"{'='*60}")
+
+    pending = 0
+    skipped = 0
+
+    for run in tuning_grid:
+        key = (run["method"], run["f_s"], run["lr"], run["T"], run["alpha"])
+        if key in done:
+            skipped += 1
+            continue
+
+        pending += 1
+        label = (
+            f"TUNE {run['method']} f_S={run['f_s']:.2f} lr={run['lr']} "
+            f"T={run['T']} alpha={run['alpha']}"
+        )
+        if dry_run:
+            print(f"  PLAN  {label}")
+            continue
+
+        logger.info("Running: %s", label)
+        # Ensure teacher checkpoint exists (f_T=1.0, seed=0)
+        teacher_ckpt = None
+        if run["method"] != "ce":
+            teacher_ckpt = get_or_train_teacher(1.0, 0, run, dry_run=False)
+
+        student_cfg = {
+            **run,
+            "role": "student",
+            "teacher_ckpt": str(teacher_ckpt) if teacher_ckpt else None,
+        }
+        t0 = time.time()
+        summary = train(student_cfg)
+        wall_time = time.time() - t0
+        steps_per_sec = summary.get("steps_per_sec", round(summary["total_steps"] / max(wall_time, 1e-6), 2))
+
+        _append_tuning_row(tuning_csv, {
+            "method": run["method"],
+            "f_S": run["f_s"],
+            "lr": run["lr"],
+            "T": run["T"],
+            "alpha": run["alpha"],
+            "val_acc": round(summary["best_val_acc"], 4),
+            "train_steps": summary["total_steps"],
+            "wall_time_s": round(wall_time, 1),
+            "steps_per_sec": steps_per_sec,
+        })
+
+    print(f"\n{'='*60}")
+    print(f"  Total tuning candidate runs: {len(tuning_grid)}")
+    print(f"  Already done (will skip): {skipped}")
+    print(f"  Pending: {pending}")
+    print(f"  Tuning CSV: {tuning_csv}")
+    print(f"  Best params will save to: {best_config_path}")
+    print(f"{'='*60}\n")
+
+    if not dry_run and tuning_csv.exists():
+        select_and_save_best_hyperparams(tuning_csv, best_config_path)
 
 
 def main(argv=None) -> None:
@@ -302,9 +513,25 @@ def main(argv=None) -> None:
         cfg["checkpoint_dir"] = args.checkpoint_dir
     if args.num_workers is not None:
         cfg["num_workers"] = args.num_workers
+    if args.max_steps_override is not None:
+        cfg["max_steps_override"] = args.max_steps_override
+
+    # If --tune requested, run tuning pipeline instead
+    if args.tune:
+        run_tuning(cfg, dry_run=args.dry_run)
+        return
 
     csv_path = Path(cfg["output_dir"]) / "results.csv"
     grid = build_grid(cfg)
+
+    # Check for tuned config file to apply
+    tuned_config_path = (
+        Path(args.tuned_config)
+        if args.tuned_config
+        else Path(cfg["output_dir"]) / "best_hyperparams.yaml"
+    )
+    if tuned_config_path.exists():
+        grid = apply_tuned_hyperparams(grid, tuned_config_path)
 
     if args.dry_run:
         print(f"\n{'='*60}")

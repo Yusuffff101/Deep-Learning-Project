@@ -38,9 +38,16 @@ from data import (
     _get_val_and_pool_indices,
     get_subset_indices,
 )
-from losses import attention_transfer_loss, ce_loss, get_loss_fn, logit_kd_loss
+from losses import _attention_map, attention_transfer_loss, ce_loss, get_loss_fn, logit_kd_loss
 from models import build_model, resnet20, resnet56
+from run_grid import (
+    apply_tuned_hyperparams,
+    build_grid,
+    build_tuning_grid,
+    select_and_save_best_hyperparams,
+)
 from train import build_config, train
+from utils import load_yaml_config
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -365,3 +372,82 @@ def test_build_model_registry():
     """build_model raises ValueError for unknown names."""
     with pytest.raises(ValueError, match="Unknown model"):
         build_model("nonexistent_model")
+
+
+# ── Test 12: Attention transfer L2-normalization ──────────────────────────────
+
+def test_attention_transfer_l2_normalization():
+    """_attention_map L2-normalizes each flattened spatial map per sample."""
+    B = 4
+    for C, H, W in [(16, 32, 32), (32, 16, 16), (64, 8, 8)]:
+        feat = torch.randn(B, C, H, W)
+        attn = _attention_map(feat)
+        assert attn.shape == (B, H * W), f"Expected shape ({B}, {H*W}), got {attn.shape}"
+        norms = torch.norm(attn, p=2, dim=1)
+        expected = torch.ones(B, dtype=torch.float32)
+        assert torch.allclose(norms, expected, atol=1e-5), f"L2 norms not 1.0: {norms}"
+
+
+# ── Test 13: Grid deduplication (Regime A vs B at f_S=1.0) ────────────────────
+
+def test_grid_no_duplicate_regime_ab_100():
+    """Regime B excludes f_S=1.0 so each f_T=1.0, f_S=1.0 experiment runs only once."""
+    cfg = load_yaml_config(Path(__file__).parent.parent / "configs" / "default.yaml")
+    grid = build_grid(cfg)
+
+    # 3 seeds × 3 methods × (5 in A + 3 in B) = 72 runs
+    assert len(grid) == 72, f"Expected 72 runs after deduplication, got {len(grid)}"
+
+    # Ensure no run in Regime B has f_S == 1.0
+    regime_b_100 = [r for r in grid if r["regime"] == "B" and abs(r["f_s"] - 1.0) < 1e-5]
+    assert len(regime_b_100) == 0, f"Found duplicate 1.0 runs in Regime B: {regime_b_100}"
+
+
+# ── Test 14: Tuning grid and hyperparameter loading ───────────────────────────
+
+def test_tuning_grid_and_config(tmp_path):
+    """Tuning grid uses seed 0, f_T=1.0, and updates main grid when applied."""
+    cfg = load_yaml_config(Path(__file__).parent.parent / "configs" / "default.yaml")
+    tuning_grid = build_tuning_grid(cfg)
+
+    assert len(tuning_grid) > 0
+    assert all(r["seed"] == 0 for r in tuning_grid)
+    assert all(r["f_t"] == 1.0 for r in tuning_grid)
+
+    # Test synthetic tuning save & apply
+    tuning_csv = tmp_path / "tuning.csv"
+    best_yaml = tmp_path / "best_hyperparams.yaml"
+
+    with open(tuning_csv, "w", newline="", encoding="utf-8") as f:
+        f.write("method,f_S,lr,T,alpha,val_acc,train_steps,wall_time_s,steps_per_sec\n")
+        f.write("ce,0.05,0.05,4.0,0.9,45.0,100,10.0,10.0\n")
+        f.write("ce,0.05,0.20,4.0,0.9,52.5,100,10.0,10.0\n")
+        f.write("logit_kd,0.05,0.10,8.0,0.5,58.0,100,10.0,10.0\n")
+
+    best = select_and_save_best_hyperparams(tuning_csv, best_yaml)
+    assert best["ce"]["0.05"]["lr"] == 0.20
+    assert best["logit_kd"]["0.05"]["T"] == 8.0
+
+    # Test applying to grid
+    grid = build_grid(cfg)
+    grid = apply_tuned_hyperparams(grid, best_yaml)
+    matched = [r for r in grid if r["method"] == "ce" and abs(r["f_s"] - 0.05) < 1e-5]
+    assert matched[0]["lr"] == 0.20
+
+
+# ── Test 15: Max steps override and per-fraction min steps ────────────────────
+
+def test_max_steps_override_and_per_fraction_min_steps(tmp_path):
+    """--max-steps-override properly bounds steps, and per-fraction min_steps is honored."""
+    args, tmp_path = _make_tiny_args("teacher", tmp_path=tmp_path)
+    args.epochs = 1
+    args.min_steps = 100
+    args.max_steps_override = 3
+    cfg = build_config(args)
+    assert cfg["max_steps_override"] == 3
+    assert "min_steps_per_fraction" in cfg
+
+    summary = train(cfg)
+    assert summary["total_steps"] == 3
+    assert "steps_per_sec" in summary
+

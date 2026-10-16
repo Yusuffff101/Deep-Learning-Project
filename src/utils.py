@@ -89,6 +89,14 @@ def load_json(path: str | Path) -> Any:
         return json.load(f)
 
 
+def save_yaml(obj: Any, path: str | Path) -> None:
+    """Serialize *obj* to YAML at *path*, creating parent dirs as needed."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(obj, f, default_flow_style=False, sort_keys=False)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoints
 # ---------------------------------------------------------------------------

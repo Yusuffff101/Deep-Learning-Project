@@ -47,8 +47,14 @@ epochs: 200
 
 # Minimum optimizer steps so tiny subsets are not under-trained.
 # 200 epochs * 352 steps/epoch (for 45k/128) ≈ 70400 steps.
-# We use 30000 as a conservative floor — adjust after profiling.
+# Configurable per fraction, with min_steps as global fallback.
 min_steps: 30000
+min_steps_per_fraction:
+  0.01: 30000
+  0.05: 30000
+  0.10: 40000
+  0.25: 50000
+  1.00: 70000
 
 # Batch size
 batch_size: 128

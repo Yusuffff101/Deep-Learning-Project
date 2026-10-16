@@ -12,17 +12,17 @@ Study KD on CIFAR-100 under data scarcity.
 
 **Two experimental regimes:**
 
-| Regime | Teacher data | Student data |
-|--------|-------------|-------------|
-| **A** | 100% (f_T = 1.0) | f_S ∈ {1%, 5%, 10%, 25%, 100%} |
-| **B** | Same fraction as student (f_T = f_S) | f_S ∈ {5%, 10%, 25%} |
-
-**Methods compared:**
-- `ce` — student trained from scratch (cross-entropy only, baseline)
-- `logit_kd` — Hinton et al. 2015 (softened logit matching)
-- `attention_transfer` — Zagoruyko & Komodakis 2017 (spatial attention maps)
-
-**Models:** ResNet-56 (teacher) → ResNet-20 (student), CIFAR-style.
+### Data Splits & Training Pool Definition
+- **CIFAR-100 Train Split**: 50,000 images total.
+- **Fixed Validation Split**: A fixed, class-stratified split of **5,000 images** (50 per class) is carved out using seed `42` (`VAL_SEED`) and held out for validation across all experiments.
+- **Training Pool ("100%")**: The remaining **45,000 images** (450 per class) form the training pool.
+- **Fractions are strictly of the 45k pool**: All percentages/fractions ($f_S, f_T$) denote exact subsets of this 45,000-image pool:
+  - **1%** = 450 images (4–5 images per class)
+  - **5%** = 2,250 images (22–23 images per class)
+  - **10%** = 4,500 images (45 images per class)
+  - **25%** = 11,250 images (~112 images per class)
+  - **100%** = 45,000 images (450 images per class)
+- The 5,000 validation images and 10,000 test images are **never** included in any training subset.
 
 ---
 
@@ -87,8 +87,14 @@ python src/evaluate.py \
 ## Running the Full Grid
 
 ```bash
-# Preview what will run (no training):
+# Preview what will run (no training, 72 student runs + 12 teachers):
 python src/run_grid.py --dry-run
+
+# Run pilot with step capping:
+python src/run_grid.py --dry-run --max-steps-override 5
+
+# Run hyperparameter tuning on seed 0:
+python src/run_grid.py --tune
 
 # Run all experiments (safely resumable):
 python src/run_grid.py --config configs/default.yaml
@@ -96,6 +102,8 @@ python src/run_grid.py --config configs/default.yaml
 
 The grid skips any configuration whose result row already exists in
 `results/results.csv`, so interrupted Kaggle sessions can be resumed safely.
+Regime A with $f_S=1.0$ and Regime B with $f_T=f_S=1.0$ are deduplicated and executed only once.
+Each run prints a timing summary with step throughput (`steps/s`) to easily extrapolate GPU runtimes.
 
 ---
 

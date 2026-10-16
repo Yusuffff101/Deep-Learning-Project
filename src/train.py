@@ -114,6 +114,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     # Misc
     p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--max-steps-override", "--max_steps_override", type=int, default=None,
+                   dest="max_steps_override", help="Cap total optimizer steps for pilot runs.")
 
     return p.parse_args(argv)
 
@@ -148,6 +150,13 @@ def build_config(args: argparse.Namespace) -> dict:
         "ece_bins": cfg.get("ece_bins", 15),
         "log_interval": cfg.get("log_interval", 50),
         "pin_memory": cfg.get("pin_memory", True),
+        "min_steps_cli": args.min_steps,
+        "min_steps_per_fraction": cfg.get("min_steps_per_fraction", {}),
+        "max_steps_override": (
+            args.max_steps_override
+            if getattr(args, "max_steps_override", None) is not None
+            else cfg.get("max_steps_override", None)
+        ),
     }
     return overrides
 
@@ -313,12 +322,27 @@ def train(cfg: dict) -> dict:
         pin_memory=cfg["pin_memory"] and device.type == "cuda",
     )
 
+    # Determine min_steps: CLI override > per-fraction mapping > global min_steps
+    if cfg.get("min_steps_cli") is not None:
+        effective_min_steps = int(cfg["min_steps_cli"])
+    elif cfg.get("min_steps_per_fraction") and isinstance(cfg["min_steps_per_fraction"], dict):
+        matched = None
+        for frac_k, steps_v in cfg["min_steps_per_fraction"].items():
+            if abs(float(frac_k) - float(fraction)) < 1e-5:
+                matched = int(steps_v)
+                break
+        effective_min_steps = matched if matched is not None else int(cfg.get("min_steps", 30000))
+    else:
+        effective_min_steps = int(cfg.get("min_steps", 30000))
+
     steps_per_epoch = len(train_loader)
-    total_steps = max(cfg["epochs"] * steps_per_epoch, cfg["min_steps"])
+    total_steps = max(cfg["epochs"] * steps_per_epoch, effective_min_steps)
+    if cfg.get("max_steps_override") is not None:
+        total_steps = min(total_steps, int(cfg["max_steps_override"]))
     total_epochs = math.ceil(total_steps / max(steps_per_epoch, 1))
     logger.info(
-        "Training budget: %d steps (%d epochs × %d steps/epoch, min_steps=%d)",
-        total_steps, total_epochs, steps_per_epoch, cfg["min_steps"],
+        "Training budget: %d steps (%d epochs × %d steps/epoch, min_steps=%d, max_steps_override=%s)",
+        total_steps, total_epochs, steps_per_epoch, effective_min_steps, cfg.get("max_steps_override"),
     )
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -411,10 +435,21 @@ def train(cfg: dict) -> dict:
 
     pbar.close()
     wall_time = time.time() - t_start
+    steps_per_sec = step / wall_time if wall_time > 0 else 0.0
+    sec_per_step = wall_time / step if step > 0 else 0.0
+
+    print(
+        f"\n{'='*60}\n"
+        f"Timing Summary: {run_id}\n"
+        f"  Total Steps : {step}\n"
+        f"  Wall Time   : {wall_time:.2f} s\n"
+        f"  Throughput  : {steps_per_sec:.2f} steps/s ({sec_per_step*1000:.1f} ms/step)\n"
+        f"{'='*60}\n"
+    )
 
     logger.info(
-        "Training complete | best_val_acc=%.2f%% | steps=%d | time=%.1fs",
-        best_val_acc, step, wall_time,
+        "Training complete | best_val_acc=%.2f%% | steps=%d | time=%.1fs | throughput=%.2f steps/s",
+        best_val_acc, step, wall_time, steps_per_sec,
     )
 
     # Save final summary
@@ -423,6 +458,7 @@ def train(cfg: dict) -> dict:
         "best_val_acc": best_val_acc,
         "total_steps": step,
         "wall_time_s": wall_time,
+        "steps_per_sec": round(steps_per_sec, 2),
         "cfg": cfg,
     }
     save_json(summary, ckpt_dir / "summary.json")
