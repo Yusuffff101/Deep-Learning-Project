@@ -1,0 +1,73 @@
+# ============================================================
+# KD-LowData — Default Configuration
+# ============================================================
+# All per-(method, fraction) hyperparameters are placeholders.
+# lr and epochs will be tuned on the validation set later.
+# ============================================================
+
+# ----- Paths (override on Kaggle) --------------------------
+data_dir: "./data"          # CIFAR-100 will be downloaded here
+output_dir: "./results"
+checkpoint_dir: "./checkpoints"
+
+# ----- Dataset ---------------------------------------------
+dataset: "cifar100"
+num_classes: 100
+val_size: 5000              # Fixed validation split from 50k train images
+val_seed: 42                # Seed for the val split; NEVER change this
+
+# ----- Experiment grid -------------------------------------
+# teacher_fractions: used for Regime A (full data) and Regime B (matched)
+teacher_fractions: [0.05, 0.10, 0.25, 1.0]
+# student_fractions
+student_fractions: [0.01, 0.05, 0.10, 0.25, 1.0]
+# Regime A: teacher always trained on f_T=1.0
+# Regime B: teacher trained on same fraction as student (f_T = f_S)
+regimes: ["A", "B"]
+methods: ["ce", "logit_kd", "attention_transfer"]
+seeds: [0, 1, 2]
+
+# ----- Models ----------------------------------------------
+teacher_model: "resnet56"
+student_model: "resnet20"
+
+# ----- Training (defaults; tune per cell on val set later) -
+# Optimizer
+optimizer: "sgd"
+momentum: 0.9
+nesterov: true
+weight_decay: 5.0e-4
+
+# Learning rate schedule
+lr: 0.1
+lr_schedule: "cosine"
+
+# Epochs (baseline; overridden by min_steps if subset is tiny)
+epochs: 200
+
+# Minimum optimizer steps so tiny subsets are not under-trained.
+# 200 epochs * 352 steps/epoch (for 45k/128) ≈ 70400 steps.
+# We use 30000 as a conservative floor — adjust after profiling.
+min_steps: 30000
+
+# Batch size
+batch_size: 128
+
+# ----- KD hyperparameters -----------------------------------
+# Logit KD (Hinton 2015)
+temperature: 4.0            # T
+alpha: 0.9                  # weight on KL term; (1-alpha) on CE
+
+# Attention Transfer (Zagoruyko 2017)
+at_beta: 1000.0             # beta weighting for AT loss
+
+# FitNets projector hidden dim (used if method == fitnets)
+fitnets_hidden: 128
+
+# ----- Evaluation -------------------------------------------
+ece_bins: 15
+
+# ----- Misc -------------------------------------------------
+num_workers: 4              # DataLoader workers; set 0 on Windows if needed
+pin_memory: true            # Set false on CPU-only machines
+log_interval: 50            # Print training log every N steps
