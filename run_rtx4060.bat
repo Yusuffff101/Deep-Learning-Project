@@ -27,10 +27,15 @@ if not exist .venv (
 echo [2/5] Activating virtual environment...
 call .venv\Scripts\activate
 
-echo [3/5] Installing PyTorch with CUDA 12.1 acceleration...
-python -m pip install -q --upgrade pip
-python -m pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -q -r requirements.txt
+echo [3/5] Checking PyTorch with CUDA installation...
+python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
+if %errorlevel% equ 0 (
+    echo [OK] PyTorch with CUDA is already installed! Skipping 2.6 GB download.
+) else (
+    echo [INFO] PyTorch CUDA package is ~2.6 GB. Downloading with progress bar...
+    python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+)
+python -m pip install -r requirements.txt
 
 echo [4/5] Checking GPU detection...
 python -c "import torch; print('CUDA Available:', torch.cuda.is_available()); print('Active GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU (WARNING)')"
