@@ -497,10 +497,11 @@ def test_tune_cli_flags():
     # List containing comma-separated string
     assert _parse_fractions(["0.01,0.25"]) == [0.01, 0.25]
 
-    args = parse_args(["--tune", "--tune-fractions", "0.01", "0.25", "--tune-max-steps", "1234"])
+    args = parse_args(["--tune", "--tune-fractions", "0.01", "0.25", "--tune-max-steps", "1234", "--seeds", "0"])
     assert args.tune is True
     assert args.tune_fractions == ["0.01", "0.25"]
     assert args.tune_max_steps == 1234
+    assert args.seeds == [0]
 
 
 # ── Test 15: Max steps override and per-fraction min steps ────────────────────

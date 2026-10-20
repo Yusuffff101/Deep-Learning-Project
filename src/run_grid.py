@@ -641,6 +641,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    dest="tune_fractions", help="Student data fractions to tune on (default: 0.01 0.10 1.0).")
     p.add_argument("--tune-max-steps", "--tune_max_steps", type=int, default=None,
                    dest="tune_max_steps", help="Cap optimizer steps for tuning runs.")
+    p.add_argument("--seeds", type=int, nargs="+", default=None,
+                   help="Override seeds list (e.g. --seeds 0 for single-seed fast mode).")
     p.add_argument("--tuned-config", default=None,
                    help="Path to YAML file with tuned hyperparameters (defaults to <output_dir>/best_hyperparams.yaml if present).")
     return p.parse_args(argv)
@@ -854,6 +856,8 @@ def main(argv=None) -> None:
         cfg["num_workers"] = args.num_workers
     if args.max_steps_override is not None:
         cfg["max_steps_override"] = args.max_steps_override
+    if args.seeds is not None:
+        cfg["seeds"] = args.seeds
 
     # If --tune requested, run tuning pipeline instead
     if args.tune:

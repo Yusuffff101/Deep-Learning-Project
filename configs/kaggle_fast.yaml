@@ -1,0 +1,63 @@
+# ============================================================
+# KD-LowData — Kaggle Fast Profile (Single Session, 100% Free)
+# ============================================================
+# Designed to complete in ~3.5 to 4.5 hours on Kaggle (P100 / T4)
+# Fits within Kaggle's 12-hour session timeout and free quota.
+# ============================================================
+
+# ----- Paths (overridden via CLI flags in Kaggle notebook) ---
+data_dir: "./data"
+output_dir: "./results"
+checkpoint_dir: "./checkpoints"
+
+# ----- Dataset ---------------------------------------------
+dataset: "cifar100"
+num_classes: 100
+val_size: 5000
+val_seed: 42
+
+# ----- Experiment grid -------------------------------------
+teacher_fractions: [0.05, 0.10, 0.25, 1.0]
+student_fractions: [0.01, 0.05, 0.10, 0.25, 1.0]
+regimes: ["A", "B"]
+methods: ["ce", "logit_kd", "attention_transfer"]
+seeds: [0]                      # Seed 0 only: 24 student runs + 4 teachers = 28 runs total
+
+# ----- Models ----------------------------------------------
+teacher_model: "resnet56"
+student_model: "resnet20"
+
+# ----- Training --------------------------------------------
+optimizer: "sgd"
+momentum: 0.9
+nesterov: true
+weight_decay: 5.0e-4
+
+lr: 0.1
+lr_schedule: "cosine"
+epochs: 200
+
+# Scaled min_steps: fast convergence while fitting inside ~3.5h
+min_steps: 15000
+min_steps_per_fraction:
+  0.01: 15000
+  0.05: 15000
+  0.10: 20000
+  0.25: 25000
+  1.00: 35000
+
+batch_size: 128
+
+# ----- KD hyperparameters -----------------------------------
+temperature: 4.0
+alpha: 0.9
+at_beta: 1000.0
+fitnets_hidden: 128
+
+# ----- Evaluation -------------------------------------------
+ece_bins: 15
+
+# ----- Misc -------------------------------------------------
+num_workers: 2
+pin_memory: true
+log_interval: 50
