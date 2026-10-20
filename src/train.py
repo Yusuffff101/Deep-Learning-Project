@@ -386,6 +386,12 @@ def train(cfg: dict) -> dict:
     epoch = 0
     pbar = tqdm(total=total_steps, desc=f"[{run_id}]", unit="step")
 
+    # Determine validation frequency: validate ~20 times during training
+    # or at least once at the end. On tiny subsets (e.g. 1% with 4 steps/epoch),
+    # validating every epoch causes thousands of 5,000-image evaluations,
+    # adding 1+ hours of pure inference overhead per run!
+    val_interval_steps = max(1, steps_per_epoch, total_steps // 20)
+
     while step < total_steps:
         epoch += 1
         for batch in train_loader:
@@ -415,23 +421,24 @@ def train(cfg: dict) -> dict:
                 )
                 loss_meter.reset()
 
-        # Validate at end of each epoch
-        val_acc = evaluate(model, val_loader, device)
-        logger.info("Epoch %d | step %d | val_acc=%.2f%%", epoch, step, val_acc)
+            # Validate at milestone intervals or when training finishes
+            if step % val_interval_steps == 0 or step >= total_steps:
+                val_acc = evaluate(model, val_loader, device)
+                logger.info("Step %d/%d (epoch %d) | val_acc=%.2f%%", step, total_steps, epoch, val_acc)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(
-                {
-                    "step": step,
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "val_acc": val_acc,
-                    "cfg": cfg,
-                },
-                ckpt_dir / "best.pth",
-            )
-            logger.info("  ↳ New best val_acc=%.2f%% — checkpoint saved.", val_acc)
+                if val_acc > best_val_acc or not (ckpt_dir / "best.pth").exists():
+                    best_val_acc = val_acc
+                    save_checkpoint(
+                        {
+                            "step": step,
+                            "epoch": epoch,
+                            "model_state": model.state_dict(),
+                            "val_acc": val_acc,
+                            "cfg": cfg,
+                        },
+                        ckpt_dir / "best.pth",
+                    )
+                    logger.info("  ↳ New best val_acc=%.2f%% — checkpoint saved.", val_acc)
 
     pbar.close()
     wall_time = time.time() - t_start

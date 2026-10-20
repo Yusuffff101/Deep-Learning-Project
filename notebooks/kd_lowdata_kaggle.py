@@ -1,18 +1,19 @@
 # ============================================================
 # KD-LowData: Knowledge Distillation under Data Scarcity
-# Kaggle Fast Notebook (100% Free, Single 12-Hour Session)
+# Universal GPU Notebook (Works 100% Free on Kaggle & Google Colab)
 #
 # SETUP INSTRUCTIONS:
 #   1. Push your kd-lowdata repository to GitHub.
-#   2. On Kaggle: New Notebook -> Settings -> Accelerator -> GPU P100 (or GPU T4 x1).
-#      (Tip: P100 is ~1.5x faster than T4 and completely free!)
-#   3. Turn ON "Internet" in the right-hand Settings pane.
+#   2. Platform Choice:
+#      - On Kaggle: New Notebook -> Settings -> Accelerator -> GPU P100 (or T4 x1).
+#      - On Colab:  New Notebook -> Runtime -> Change runtime type -> T4 GPU.
+#   3. Ensure Internet is enabled (Kaggle: Settings -> Internet ON).
 #   4. Run cells in order: CELL 1 -> 2 -> 3 -> 4 -> (PHASE 1) -> PHASE 2 -> PHASE 3.
 #
-# TOTAL ESTIMATED TIME ON FREE KAGGLE GPU:
+# TOTAL ESTIMATED TIME ON FREE GPU:
 #   Phase 2 Grid (Seed 0, fast budget): ~3.5 hours on P100 (~4.5 hours on T4)
 #   Phase 3 Plots & Summary tables   : < 5 minutes
-#   Total: ~3.5 to 4.5 hours total (fits inside a single 12h session!)
+#   Total: ~3.5 to 4.5 hours total (fits inside a single free session!)
 #
 # The grid is FULLY RESUMABLE if interrupted.
 # ============================================================
@@ -25,8 +26,15 @@ import os
 import subprocess
 import sys
 
+# Auto-detect platform: Google Colab vs Kaggle vs Local
+IS_COLAB = "google.colab" in sys.modules or os.path.exists("/content")
+IS_KAGGLE = os.path.exists("/kaggle")
+BASE_DIR = "/content" if IS_COLAB else ("/kaggle/working" if IS_KAGGLE else os.path.abspath("."))
+print(f"Platform: {'Google Colab' if IS_COLAB else ('Kaggle' if IS_KAGGLE else 'Local/Other')}")
+print(f"Base Directory: {BASE_DIR}")
+
 REPO_URL = "https://github.com/YOUR_USERNAME/kd-lowdata.git"  # !! CHANGE THIS !!
-REPO_DIR = "/kaggle/working/kd-lowdata"
+REPO_DIR = os.path.join(BASE_DIR, "kd-lowdata")
 
 if not os.path.exists(REPO_DIR):
     print("Cloning repository...")
@@ -45,7 +53,7 @@ if torch.cuda.is_available():
     vram = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"VRAM: {vram:.1f} GB")
 else:
-    print("WARNING: No GPU found! Go to Settings -> Accelerator -> GPU P100 or GPU T4 x1")
+    print("WARNING: No GPU found! On Colab: Runtime -> Change runtime type -> T4 GPU. On Kaggle: Settings -> Accelerator -> GPU P100/T4.")
 
 subprocess.run(["pip", "install", "-q", "pyyaml", "tqdm", "matplotlib", "pandas"], check=True)
 print("Dependencies OK.")
@@ -57,10 +65,9 @@ print("Dependencies OK.")
 from pathlib import Path
 import yaml
 
-REPO_DIR   = "/kaggle/working/kd-lowdata"
-DATA_DIR   = "/kaggle/working/data"          # CIFAR-100 auto-downloads here (~170 MB)
-OUTPUT_DIR = "/kaggle/working/results"        # CSV files and plots
-CKPT_DIR   = "/kaggle/working/checkpoints"   # Model checkpoints
+DATA_DIR   = os.path.join(BASE_DIR, "data")          # CIFAR-100 auto-downloads here (~170 MB)
+OUTPUT_DIR = os.path.join(BASE_DIR, "results")       # CSV files and plots
+CKPT_DIR   = os.path.join(BASE_DIR, "checkpoints")   # Model checkpoints
 
 os.makedirs(DATA_DIR,   exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -83,7 +90,7 @@ print("  Seeds:             ", cfg["seeds"])
 print("  Batch size:        ", cfg["batch_size"])
 print("  Total student runs: 24 (Seed 0)")
 print("  Total teacher runs: 4  (Seed 0)")
-print("  Estimated time:     ~3.5 hours on P100 (~4.5 hours on T4)")
+print("  Estimated time:     ~3.5h on P100 / ~4.5h on T4")
 
 # Shorthand for building subprocess commands
 RUN_GRID    = [sys.executable, os.path.join(REPO_DIR, "src", "run_grid.py")]
@@ -343,11 +350,20 @@ else:
 # -----------------------------------------------------------
 import shutil
 
-shutil.make_archive("/kaggle/working/kd_results", "zip", OUTPUT_DIR)
-print("Zipped: /kaggle/working/kd_results.zip")
+zip_path = os.path.join(BASE_DIR, "kd_results")
+shutil.make_archive(zip_path, "zip", OUTPUT_DIR)
+print(f"Zipped results to: {zip_path}.zip")
 print("Contents:")
 for p in sorted(Path(OUTPUT_DIR).rglob("*")):
     if p.is_file():
         mb = p.stat().st_size / 1e6
         rel = str(p.relative_to(OUTPUT_DIR))
         print(f"  {rel}  ({mb:.2f} MB)")
+
+if IS_COLAB:
+    try:
+        from google.colab import files
+        print("\nTriggering browser download for kd_results.zip...")
+        files.download(f"{zip_path}.zip")
+    except Exception as e:
+        print(f"\nNote: You can download {zip_path}.zip from the Files panel on the left sidebar.")
