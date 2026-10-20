@@ -33,7 +33,7 @@ BASE_DIR = "/content" if IS_COLAB else ("/kaggle/working" if IS_KAGGLE else os.p
 print(f"Platform: {'Google Colab' if IS_COLAB else ('Kaggle' if IS_KAGGLE else 'Local/Other')}")
 print(f"Base Directory: {BASE_DIR}")
 
-REPO_URL = "https://github.com/YOUR_USERNAME/kd-lowdata.git"  # !! CHANGE THIS !!
+REPO_URL = "https://github.com/Yusuffff101/Deep-Learning-Project.git"
 REPO_DIR = os.path.join(BASE_DIR, "kd-lowdata")
 
 if not os.path.exists(REPO_DIR):
