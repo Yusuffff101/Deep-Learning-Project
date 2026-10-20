@@ -28,9 +28,9 @@ echo [2/5] Activating virtual environment...
 call .venv\Scripts\activate
 
 echo [3/5] Installing PyTorch with CUDA 12.1 acceleration...
-pip install -q --upgrade pip
-pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install -q -r requirements.txt
+python -m pip install -q --upgrade pip
+python -m pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -q -r requirements.txt
 
 echo [4/5] Checking GPU detection...
 python -c "import torch; print('CUDA Available:', torch.cuda.is_available()); print('Active GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU (WARNING)')"
